@@ -120,6 +120,10 @@ OpenAI Whisper API'si ile uyumludur; mevcut istemciler doğrudan çalışır.
 
 - `GET /health` — durum kontrolü
 - `GET /v1/models` — model listesi
+- `WS /v1/live` — canlı akış (web arayüzünün kullandığı WebSocket; istemci ham
+  PCM gönderir — 16 kHz mono f32le — sunucu `partial`/`commit` JSON mesajları
+  döner; zorunlu önekli artımlı çözümleme sayesinde adım gecikmesi ~0,3-0,5 sn)
+- `POST /v1/translate` — JSON `{"text": "...", "target": "tr"}` → `{"translation": "..."}`
 - `POST /v1/audio/transcriptions` — multipart form:
   - `file` (zorunlu): ses dosyası
   - `language` (isteğe bağlı): konuşma dili (`tr`, `en`, ... veya tam ad)

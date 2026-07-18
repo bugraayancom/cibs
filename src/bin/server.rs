@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Multipart, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -14,6 +16,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use qwen3_asr::asr::AsrModel;
+use qwen3_asr::audio::SAMPLE_RATE;
 use qwen3_asr::translate::Translator;
 
 #[derive(Debug, Parser)]
@@ -74,20 +77,36 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     info!(path = %args.model_dir.display(), "loading model");
-    let model = AsrModel::load(&args.model_dir)?;
+    let mut model = AsrModel::load(&args.model_dir)?;
     info!("model ready");
 
-    let translator = match &args.translator_dir {
-        Some(dir) => {
-            let t = Translator::load(dir)?;
-            Some(Mutex::new(t))
-        }
+    let mut translator = match &args.translator_dir {
+        Some(dir) => Some(Translator::load(dir)?),
         None => None,
     };
 
+    // Warmup: the first request otherwise pays several seconds of Metal
+    // kernel compilation. Run a dummy pass through both models now.
+    {
+        let t0 = Instant::now();
+        let silence = vec![0.0f32; SAMPLE_RATE as usize];
+        if let Err(e) = model.transcribe_samples(&silence, None, 4) {
+            warn!(error = %e, "ASR warmup failed");
+        }
+        if let Some(tr) = translator.as_mut() {
+            if let Err(e) = tr.translate("Hello.", "Turkish") {
+                warn!(error = %e, "translator warmup failed");
+            }
+        }
+        info!(
+            elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f64()),
+            "warmup done"
+        );
+    }
+
     let state = Arc::new(AppState {
         model: Mutex::new(model),
-        translator,
+        translator: translator.map(Mutex::new),
         translation_cache: Mutex::new(None),
         api_key: args.api_key,
         max_tokens: args.max_tokens,
@@ -101,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(list_models))
         .route("/v1/audio/transcriptions", post(transcribe))
         .route("/v1/translate", post(translate_text))
+        .route("/v1/live", get(live_ws))
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
@@ -234,44 +254,21 @@ buluta gönderilmez.</div>
 Başkanlığı &middot; Tamamen çevrimdışı çalışır.</footer>
 
 <script>
-async function transcribe(blob, filename, language, translateTo) {
-  const data = new FormData();
-  data.append('file', blob, filename);
-  data.append('model', 'cibs');
-  data.append('response_format', 'verbose_json');
-  if (language) data.append('language', language);
-  if (translateTo) data.append('translate_to', translateTo);
-  const r = await fetch('/v1/audio/transcriptions', { method: 'POST', body: data });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error?.message || r.status);
-  return j;
-}
-
-// Segmented streaming: MediaRecorder chunks accumulate and the recording so
-// far is re-transcribed every interval. To keep the per-step cost (and thus
-// the latency) bounded, the recorder is restarted every SEGMENT_MS; finished
-// segments are frozen and prepended to the display. Translation runs in a
-// separate loop against /v1/translate so it never blocks transcription.
-const SEGMENT_MS = 15000;
-const STEP_MS = 1500;
+// Live pipeline: an AudioWorklet captures raw microphone PCM, ~250 ms slices
+// are streamed over a WebSocket to /v1/live, and the server runs a stateful
+// forced-prefix decode so each step only generates the newest tokens.
+// Translation runs in a separate loop against /v1/translate so it never
+// blocks transcription.
 const TR_MS = 1200;
 const micBtn = document.getElementById('mic');
 const asrOut = document.getElementById('asrOut');
 const trOut = document.getElementById('trOut');
 const stat = document.getElementById('stat');
 const dot = document.getElementById('dot');
-let rec = null, stream = null, chunks = [], timer = null, trTimer = null;
-let busy = false, trBusy = false, lastTranslated = null;
-let segStart = 0;
+let ws = null, audioCtx = null, worklet = null, mediaStream = null;
+let running = false, trTimer = null, trBusy = false, lastTranslated = null;
 let segTexts = [], segTrs = [];   // committed (frozen) segments
 let curText = '', curTr = '';     // current segment, still changing
-
-function extFor(mime) {
-  if (!mime) return 'webm';
-  if (mime.includes('mp4')) return 'mp4';
-  if (mime.includes('ogg')) return 'ogg';
-  return 'webm';
-}
 
 function render() {
   const t = segTexts.concat(curText ? [curText] : []).join(' ');
@@ -300,7 +297,7 @@ async function fetchTranslation(text, target) {
 }
 
 // Continuously translates the current partial transcript, independent of the
-// transcription loop.
+// transcription stream.
 async function translateStep() {
   const target = document.getElementById('target').value;
   if (!target || trBusy) return;
@@ -328,75 +325,121 @@ function finalizeSegment(idx, text) {
     .catch(() => {});
 }
 
-function startSegment() {
-  chunks = [];
-  rec = new MediaRecorder(stream);
-  rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-  rec.start(500);
-  segStart = performance.now();
+// --- microphone capture: AudioWorklet → 16 kHz f32 PCM → WebSocket ---
+const workletCode = `
+class PcmCapture extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) this.port.postMessage(ch.slice(0));
+    return true;
+  }
+}
+registerProcessor('pcm-capture', PcmCapture);
+`;
+
+function resampleTo16k(f32, srcRate) {
+  if (srcRate === 16000) return f32;
+  const ratio = srcRate / 16000;
+  const n = Math.floor(f32.length / ratio);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = i * ratio;
+    const i0 = Math.floor(x);
+    const frac = x - i0;
+    const a = f32[i0];
+    const b = f32[Math.min(i0 + 1, f32.length - 1)];
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
 }
 
-async function liveStep(final = false) {
-  if (busy || chunks.length === 0) return;
-  busy = true;
-  // Segment full: freeze what we have and restart the recorder so the next
-  // request only carries fresh audio (bounds per-step latency).
-  const rollover = rec && (performance.now() - segStart) > SEGMENT_MS;
-  if (rollover) {
-    rec.stop();
-    await new Promise(r => setTimeout(r, 150)); // flush last chunk
-  }
-  const mime = rec ? rec.mimeType : 'audio/webm';
-  const blob = new Blob(chunks, { type: mime });
-  if (rollover) startSegment();
-  try {
-    const t0 = performance.now();
-    const j = await transcribe(blob, 'live.' + extFor(mime),
-                               document.getElementById('srcLang').value, null);
-    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+let pcmParts = [], pcmLen = 0;
+function onPcm(chunk) {
+  pcmParts.push(chunk);
+  pcmLen += chunk.length;
+  if (pcmLen < audioCtx.sampleRate / 4) return; // ~250 ms slices
+  const all = new Float32Array(pcmLen);
+  let o = 0;
+  for (const p of pcmParts) { all.set(p, o); o += p.length; }
+  pcmParts = []; pcmLen = 0;
+  const out = resampleTo16k(all, audioCtx.sampleRate);
+  if (ws && ws.readyState === 1) ws.send(out.buffer);
+}
+
+function handleServerMsg(e) {
+  let j;
+  try { j = JSON.parse(e.data); } catch (_) { return; }
+  if (j.type === 'partial') {
     curText = j.text || '';
-    if (rollover || final) {
-      const idx = segTexts.length;
-      segTexts.push(curText);
-      segTrs.push(curTr || '…');
-      finalizeSegment(idx, curText);
-      curText = ''; curTr = ''; lastTranslated = null;
-    }
     render();
-    stat.textContent = (j.duration?.toFixed(0) || '?') + ' sn ses · adım ' +
-                       secs + ' sn' + (j.language ? ' · ' + j.language : '');
-  } catch (err) {
-    stat.textContent = 'hata: ' + err.message;
-  } finally {
-    busy = false;
-    if (final) stat.textContent += ' · bitti';
+    stat.textContent = (j.audio_s?.toFixed(0) || '?') + ' sn ses · adım ' +
+                       ((j.step_ms || 0) / 1000).toFixed(1) + ' sn' +
+                       (j.language ? ' · ' + j.language : '');
+  } else if (j.type === 'commit') {
+    const idx = segTexts.length;
+    segTexts.push(j.text || '');
+    segTrs.push(curTr || '…');
+    finalizeSegment(idx, j.text || '');
+    curText = ''; curTr = ''; lastTranslated = null;
+    render();
+  } else if (j.type === 'error') {
+    stat.textContent = 'hata: ' + j.message;
   }
+}
+
+async function startLive() {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (err) {
+    trOut.textContent = 'Mikrofon izni alınamadı: ' + err.message;
+    return false;
+  }
+  audioCtx = new AudioContext({ sampleRate: 16000 });
+  const url = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
+  await audioCtx.audioWorklet.addModule(url);
+  const src = audioCtx.createMediaStreamSource(mediaStream);
+  worklet = new AudioWorkletNode(audioCtx, 'pcm-capture');
+  worklet.port.onmessage = (e) => onPcm(e.data);
+  src.connect(worklet);
+
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  ws = new WebSocket(proto + location.host + '/v1/live');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => ws.send(JSON.stringify({
+    type: 'config',
+    language: document.getElementById('srcLang').value || null,
+  }));
+  ws.onmessage = handleServerMsg;
+  ws.onclose = () => { if (running) stopLive(); };
+  return true;
+}
+
+function stopLive() {
+  running = false;
+  clearInterval(trTimer); trTimer = null;
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ type: 'stop' })); } catch (_) {}
+  }
+  const w = ws; ws = null;
+  // Give the server a moment to send the final partial + commit.
+  if (w) setTimeout(() => { try { w.close(); } catch (_) {} }, 2500);
+  if (worklet) { worklet.disconnect(); worklet = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  pcmParts = []; pcmLen = 0;
+  micBtn.textContent = 'Dinlemeye başla';
+  micBtn.classList.remove('rec');
+  dot.style.visibility = 'hidden';
+  stat.textContent += ' · bitti';
 }
 
 micBtn.addEventListener('click', async () => {
-  if (rec) { // stop
-    clearInterval(timer); timer = null;
-    clearInterval(trTimer); trTimer = null;
-    const r = rec;
-    rec = null;
-    r.stop();
-    stream.getTracks().forEach(t => t.stop());
-    stream = null;
-    micBtn.textContent = 'Dinlemeye başla';
-    micBtn.classList.remove('rec');
-    dot.style.visibility = 'hidden';
-    setTimeout(() => liveStep(true), 400); // final pass with remaining audio
-    return;
-  }
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (err) {
-    trOut.textContent = 'Mikrofon izni alınamadı: ' + err.message;
-    return;
-  }
+  if (running) { stopLive(); return; }
   segTexts = []; segTrs = []; curText = ''; curTr = ''; lastTranslated = null;
-  startSegment();
-  timer = setInterval(liveStep, STEP_MS);
+  if (!await startLive()) return;
+  running = true;
   trTimer = setInterval(translateStep, TR_MS);
   micBtn.textContent = 'Durdur';
   micBtn.classList.add('rec');
@@ -598,6 +641,168 @@ async fn transcribe(
             .into_response())
         }
     }
+}
+
+/// Streaming parameters from the official Qwen3-ASR recipe: the first
+/// N chunks are decoded from scratch; afterwards the previous response is
+/// kept as a forced prefix minus the last few (unstable) tokens.
+const UNFIXED_CHUNK_NUM: usize = 2;
+const UNFIXED_TOKEN_NUM: usize = 5;
+/// Run a step once this much new audio has accumulated.
+const LIVE_CHUNK_SECS: f32 = 1.0;
+/// Commit the text and restart the buffer after this much audio, so the
+/// re-encoding cost per step stays bounded.
+const LIVE_SEGMENT_SECS: f32 = 15.0;
+
+async fn live_ws(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = live_session(state, socket).await {
+            warn!(error = %e, "live session ended with error");
+        }
+    })
+}
+
+/// Stateful live-transcription session over a WebSocket.
+///
+/// Protocol: the client streams raw PCM (16 kHz mono f32le) as binary frames
+/// and JSON control messages (`{"type":"config","language":...}`,
+/// `{"type":"stop"}`) as text frames. The server answers with
+/// `{"type":"partial",...}` after every step and `{"type":"commit","text":..}`
+/// when a segment is frozen.
+async fn live_session(state: Arc<AppState>, mut socket: WebSocket) -> anyhow::Result<()> {
+    let chunk_samples = (LIVE_CHUNK_SECS * SAMPLE_RATE as f32) as usize;
+    let segment_samples = (LIVE_SEGMENT_SECS * SAMPLE_RATE as f32) as usize;
+    let min_samples = SAMPLE_RATE as usize / 2; // 0.5 s before the first step
+
+    let mut language: Option<String> = None;
+    let mut buffer: Vec<f32> = Vec::new();
+    let mut prev_tokens: Vec<u32> = Vec::new();
+    let mut step_count = 0usize;
+    let mut last_step_len = 0usize;
+    let mut stopping = false;
+    let mut closed = false;
+
+    info!("live session opened");
+
+    while !closed {
+        // Block briefly for the next frame, then drain whatever else queued
+        // up while the previous step was running.
+        let mut got_any = false;
+        loop {
+            let wait = if got_any { 2 } else { 100 };
+            match tokio::time::timeout(Duration::from_millis(wait), socket.recv()).await {
+                Ok(Some(Ok(msg))) => {
+                    got_any = true;
+                    match msg {
+                        WsMessage::Binary(b) => {
+                            buffer.extend(
+                                b.chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                            );
+                        }
+                        WsMessage::Text(t) => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                                match v.get("type").and_then(|x| x.as_str()) {
+                                    Some("config") => {
+                                        language = v
+                                            .get("language")
+                                            .and_then(|x| x.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(|s| s.to_string());
+                                    }
+                                    Some("stop") => stopping = true,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        WsMessage::Close(_) => {
+                            closed = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some(Err(_))) | Ok(None) => {
+                    closed = true;
+                    break;
+                }
+                Err(_) => break, // nothing pending right now
+            }
+        }
+
+        let has_new = buffer.len() > last_step_len;
+        let step_due = buffer.len() >= min_samples
+            && (buffer.len() >= last_step_len + chunk_samples || (stopping && has_new));
+        if !step_due {
+            if stopping {
+                break;
+            }
+            continue;
+        }
+
+        let forced: Vec<u32> = if step_count < UNFIXED_CHUNK_NUM {
+            Vec::new()
+        } else {
+            let keep = prev_tokens.len().saturating_sub(UNFIXED_TOKEN_NUM);
+            prev_tokens[..keep].to_vec()
+        };
+
+        let t0 = Instant::now();
+        let step = {
+            let mut model = state.model.lock().await;
+            model.transcribe_stream_step(&buffer, language.as_deref(), &forced, 256)
+        };
+        let (tokens, tr) = match step {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = socket
+                    .send(WsMessage::Text(
+                        serde_json::json!({ "type": "error", "message": e.to_string() })
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+                break;
+            }
+        };
+        prev_tokens = tokens;
+        last_step_len = buffer.len();
+        step_count += 1;
+
+        let partial = serde_json::json!({
+            "type": "partial",
+            "text": tr.text,
+            "language": tr.language,
+            "audio_s": tr.audio_seconds,
+            "step_ms": t0.elapsed().as_millis() as u64,
+        });
+        if socket
+            .send(WsMessage::Text(partial.to_string().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+
+        // Segment full (or session ending): freeze the text, restart buffer.
+        if buffer.len() >= segment_samples || stopping {
+            let commit = serde_json::json!({ "type": "commit", "text": tr.text });
+            let _ = socket
+                .send(WsMessage::Text(commit.to_string().into()))
+                .await;
+            buffer.clear();
+            prev_tokens.clear();
+            step_count = 0;
+            last_step_len = 0;
+        }
+        if stopping {
+            break;
+        }
+    }
+
+    let _ = socket.send(WsMessage::Close(None)).await;
+    info!("live session closed");
+    Ok(())
 }
 
 #[derive(Deserialize)]
