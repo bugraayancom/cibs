@@ -39,6 +39,7 @@ pub struct AsrTokenizer {
     pub audio_start: u32,
     pub audio_end: u32,
     pub audio_pad: u32,
+    pub asr_text: u32,
     pub newline: u32,
 }
 
@@ -62,6 +63,7 @@ impl AsrTokenizer {
         let audio_start = token_id("<|audio_start|>")?;
         let audio_end = token_id("<|audio_end|>")?;
         let audio_pad = token_id("<|audio_pad|>")?;
+        let asr_text = token_id("<asr_text>")?;
 
         let newline = {
             let enc = inner
@@ -84,6 +86,7 @@ impl AsrTokenizer {
             audio_start,
             audio_end,
             audio_pad,
+            asr_text,
             newline,
         })
     }
@@ -175,8 +178,13 @@ impl AsrTokenizer {
     /// (in place of the `<|audio_pad|>` placeholders of the chat template).
     ///
     /// Layout (matches the model's chat template):
-    /// `<|im_start|>system\n{language?}<|im_end|>\n<|im_start|>user\n`
+    /// `<|im_start|>system\n{context?}<|im_end|>\n<|im_start|>user\n`
     /// `<|audio_start|>{AUDIO}<|audio_end|><|im_end|>\n<|im_start|>assistant\n`
+    ///
+    /// When `language` is set, the official forced-language recipe appends
+    /// `language {Lang}<asr_text>` right after the generation prompt so the
+    /// model must continue with a transcript in that language (instead of
+    /// emitting its own auto-detected `language ...<asr_text>` header).
     pub fn build_prompt(
         &self,
         language: Option<&str>,
@@ -188,15 +196,10 @@ impl AsrTokenizer {
         prefix.push(self.im_start);
         prefix.extend(self.encode("system")?);
         prefix.push(self.newline);
-        let mut system_text = String::new();
         if let Some(ctx) = context {
-            system_text.push_str(ctx);
-        }
-        if let Some(lang) = language {
-            system_text.push_str(lang);
-        }
-        if !system_text.is_empty() {
-            prefix.extend(self.encode(&system_text)?);
+            if !ctx.is_empty() {
+                prefix.extend(self.encode(ctx)?);
+            }
         }
         prefix.push(self.im_end);
         prefix.push(self.newline);
@@ -215,6 +218,10 @@ impl AsrTokenizer {
         suffix.push(self.im_start);
         suffix.extend(self.encode("assistant")?);
         suffix.push(self.newline);
+        if let Some(lang) = language {
+            suffix.extend(self.encode(&format!("language {lang}"))?);
+            suffix.push(self.asr_text);
+        }
 
         Ok((prefix, suffix))
     }
