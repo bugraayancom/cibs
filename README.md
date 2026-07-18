@@ -58,8 +58,8 @@ brew install cmake ffmpeg
 ### 2. Kaynağı alın ve derleyin
 
 ```bash
-git clone <REPO_URL> cibs
-cd cibs/qwen3_asr_rs
+git clone https://github.com/bugraayancom/cibs.git
+cd cibs
 cargo build --release
 ```
 
@@ -72,11 +72,11 @@ gerekmez.
 ```bash
 pip install -U "huggingface_hub[cli]"   # veya: brew install huggingface-cli
 
-mkdir -p ../models
+mkdir -p models
 # Konuşma tanıma modeli (~2 GB)
-huggingface-cli download Qwen/Qwen3-ASR-0.6B --local-dir ../models/Qwen3-ASR-0.6B
+huggingface-cli download Qwen/Qwen3-ASR-0.6B --local-dir ./models/Qwen3-ASR-0.6B
 # Çeviri modeli (~4 GB) — daha hızlı ama basit kalite için Qwen3-0.6B da kullanılabilir
-huggingface-cli download Qwen/Qwen3-1.7B --local-dir ../models/Qwen3-1.7B
+huggingface-cli download Qwen/Qwen3-1.7B --local-dir ./models/Qwen3-1.7B
 ```
 
 Bu adımdan sonra internet bağlantısı gerekmez.
@@ -85,8 +85,8 @@ Bu adımdan sonra internet bağlantısı gerekmez.
 
 ```bash
 ./target/release/cibs-server \
-  --model-dir ../models/Qwen3-ASR-0.6B \
-  --translator-dir ../models/Qwen3-1.7B
+  --model-dir ./models/Qwen3-ASR-0.6B \
+  --translator-dir ./models/Qwen3-1.7B
 ```
 
 Tarayıcıda `http://127.0.0.1:8080` adresini açın, **Dinlemeye başla**
@@ -98,15 +98,15 @@ izni isteyecektir.
 
 ```bash
 # Dosyadan transkripsiyon
-./target/release/cibs ../models/Qwen3-ASR-0.6B kayit.mp3
+./target/release/cibs ./models/Qwen3-ASR-0.6B kayit.mp3
 
 # Transkripsiyon + Türkçeye çeviri
-./target/release/cibs ../models/Qwen3-ASR-0.6B kayit.mp3 \
-  --translate-to tr --translator-dir ../models/Qwen3-1.7B
+./target/release/cibs ./models/Qwen3-ASR-0.6B kayit.mp3 \
+  --translate-to tr --translator-dir ./models/Qwen3-1.7B
 
 # Canlı mikrofon (terminalden)
-./target/release/cibs ../models/Qwen3-ASR-0.6B --live \
-  --translate-to tr --translator-dir ../models/Qwen3-1.7B
+./target/release/cibs ./models/Qwen3-ASR-0.6B --live \
+  --translate-to tr --translator-dir ./models/Qwen3-1.7B
 ```
 
 Canlı modda mevcut satır yerinde güncellenir; segment dolunca satır
