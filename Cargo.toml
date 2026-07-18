@@ -1,0 +1,66 @@
+[package]
+name = "cibs"
+version = "0.1.0"
+edition = "2021"
+description = "CİBS (CİB Simultane): fully local live speech transcription and translation on Apple Silicon (Rust + MLX)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "qwen3_asr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cibs"
+path = "src/main.rs"
+
+[[bin]]
+name = "cibs-server"
+path = "src/bin/server.rs"
+
+[features]
+default = ["mlx"]
+# MLX backend: Metal GPU acceleration on Apple Silicon.
+mlx = ["dep:mlx-rs"]
+# Compatibility no-op: audio decoding shells out to the system `ffmpeg` binary
+# at runtime, nothing is compiled or linked at build time.
+build-ffmpeg = []
+# Reserved for a future libtorch backend (not implemented yet).
+tch = []
+
+[dependencies]
+mlx-rs = { version = "0.25.3", optional = true, features = ["metal", "accelerate"] }
+
+# model loading
+safetensors = "0.6"
+memmap2 = "0.9"
+half = "2"
+
+# config / tokenizer
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.22"
+
+# audio / dsp
+hound = "3.5"
+realfft = "3"
+
+# errors / logging / cli
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+# server
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+lto = "thin"
+
+# The stock mlx-sys builds MLX (and its Metal shaders) from source, which
+# requires the full Xcode `metal` toolchain. The vendored copy links against
+# the prebuilt libmlx.dylib from the official MLX wheel instead (vendor/mlx),
+# so only Command Line Tools are needed.
+[patch.crates-io]
+mlx-sys = { path = "vendor/mlx-sys" }

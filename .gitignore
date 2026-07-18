@@ -1,0 +1,9 @@
+/target/
+**/*.rs.bk
+.DS_Store
+samples/*.flac
+samples/jfk.wav
+/tmp/
+/models/
+*.log
+nohup.out
