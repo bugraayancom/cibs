@@ -11,6 +11,7 @@ use crate::config::TextConfig;
 use crate::decoder::Decoder;
 use crate::error::{Error, Result};
 use crate::generate::{self, GenerateConfig};
+use crate::qlinear::QuantParams;
 use crate::weights::Weights;
 
 /// Qwen3 chat-model wrapper specialized for translation prompts.
@@ -33,6 +34,18 @@ impl Translator {
         let cfg_text = std::fs::read_to_string(&cfg_path).map_err(|e| Error::io(&cfg_path, e))?;
         // Plain Qwen3 config keeps the text fields at the top level.
         let text_cfg: TextConfig = serde_json::from_str(&cfg_text)?;
+
+        // MLX-quantized checkpoints (mlx-community/...-4bit) carry a
+        // top-level `quantization` object.
+        let quant = serde_json::from_str::<serde_json::Value>(&cfg_text)?
+            .get("quantization")
+            .map(|q| QuantParams {
+                group_size: q.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32,
+                bits: q.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32,
+            });
+        if let Some(q) = quant {
+            tracing::info!(bits = q.bits, group_size = q.group_size, "quantized model");
+        }
 
         let tok_path = model_dir.join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tok_path)?;
@@ -60,7 +73,7 @@ impl Translator {
         };
 
         let mut weights = Weights::load(model_dir)?;
-        let decoder = Decoder::load_with_prefix(&mut weights, &text_cfg, "")?;
+        let decoder = Decoder::load_with_prefix(&mut weights, &text_cfg, "", quant)?;
         tracing::info!("translator ready");
 
         Ok(Translator {

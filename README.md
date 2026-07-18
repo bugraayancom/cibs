@@ -40,7 +40,9 @@ kurumlar için tasarlanmıştır:
   `cibs-server` (web arayüzü + API)
 
 Performans: M serisi işlemcilerde 0.6B ASR modeli gerçek zamanın çok altında
-çalışır (RTF ~0.1–0.2); canlı çeviri adım gecikmesi tipik olarak 1–2 saniyedir.
+çalışır (RTF ~0.1–0.2). 4-bit kuantize çeviri modeliyle (önerilen) çeviri
+gecikmesi tipik olarak 0,5–1 saniyedir; MLX kuantize checkpoint'leri
+(`mlx-community/...-4bit`) doğrudan yüklenir.
 
 ## Kurulum
 
@@ -75,9 +77,13 @@ pip install -U "huggingface_hub[cli]"   # veya: brew install huggingface-cli
 mkdir -p models
 # Konuşma tanıma modeli (~2 GB)
 huggingface-cli download Qwen/Qwen3-ASR-0.6B --local-dir ./models/Qwen3-ASR-0.6B
-# Çeviri modeli (~4 GB) — daha hızlı ama basit kalite için Qwen3-0.6B da kullanılabilir
-huggingface-cli download Qwen/Qwen3-1.7B --local-dir ./models/Qwen3-1.7B
+# Çeviri modeli — 4-bit kuantize (~1 GB, önerilen: 5-20x daha hızlı üretim)
+huggingface-cli download mlx-community/Qwen3-1.7B-4bit --local-dir ./models/Qwen3-1.7B-4bit
 ```
+
+Tam hassasiyetli (bf16) çeviri modeli tercih ederseniz
+`Qwen/Qwen3-1.7B` (~4 GB) de kullanılabilir; motor, `config.json` içindeki
+`quantization` alanına bakarak iki formatı da otomatik tanır.
 
 Bu adımdan sonra internet bağlantısı gerekmez.
 
@@ -86,7 +92,7 @@ Bu adımdan sonra internet bağlantısı gerekmez.
 ```bash
 ./target/release/cibs-server \
   --model-dir ./models/Qwen3-ASR-0.6B \
-  --translator-dir ./models/Qwen3-1.7B
+  --translator-dir ./models/Qwen3-1.7B-4bit
 ```
 
 Tarayıcıda `http://127.0.0.1:8080` adresini açın, **Dinlemeye başla**
@@ -102,11 +108,11 @@ izni isteyecektir.
 
 # Transkripsiyon + Türkçeye çeviri
 ./target/release/cibs ./models/Qwen3-ASR-0.6B kayit.mp3 \
-  --translate-to tr --translator-dir ./models/Qwen3-1.7B
+  --translate-to tr --translator-dir ./models/Qwen3-1.7B-4bit
 
 # Canlı mikrofon (terminalden)
 ./target/release/cibs ./models/Qwen3-ASR-0.6B --live \
-  --translate-to tr --translator-dir ./models/Qwen3-1.7B
+  --translate-to tr --translator-dir ./models/Qwen3-1.7B-4bit
 ```
 
 Canlı modda mevcut satır yerinde güncellenir; segment dolunca satır
@@ -165,6 +171,9 @@ mikrofon / dosya
 - Çeviri, aynı Rust çözücü implementasyonuyla çalışan bağımsız bir Qwen3
   instruct modelidir; `--translator-dir` ile istenen boyut seçilebilir
   (0.6B hızlı / 1.7B dengeli / 4B yüksek kalite).
+- 4/8-bit MLX kuantize ağırlıklar desteklenir: kuantize katmanlar
+  `quantized_matmul` ile doğrudan paketlenmiş halde çalıştırılır
+  (dequantize edilmez), bu da üretimi hızlandırıp belleği ~4'te 1'e indirir.
 
 ## Testler
 

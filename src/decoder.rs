@@ -5,22 +5,22 @@ use mlx_rs::ops::indexing::{argmax, IndexOp};
 use mlx_rs::{nn, ops, Array, Dtype};
 
 use crate::config::ModelConfig;
-use crate::encoder::linear;
 use crate::error::Result;
+use crate::qlinear::{Embedding, Linear, QuantParams};
 use crate::weights::Weights;
 
 struct DecoderLayer {
     input_ln: Array,
     post_ln: Array,
-    q_w: Array,
-    k_w: Array,
-    v_w: Array,
-    o_w: Array,
+    q_w: Linear,
+    k_w: Linear,
+    v_w: Linear,
+    o_w: Linear,
     q_norm: Array,
     k_norm: Array,
-    gate_w: Array,
-    up_w: Array,
-    down_w: Array,
+    gate_w: Linear,
+    up_w: Linear,
+    down_w: Linear,
 }
 
 struct KvCache {
@@ -30,8 +30,8 @@ struct KvCache {
 
 /// Qwen3 text decoder used by the ASR thinker.
 pub struct Decoder {
-    embed_tokens: Array,
-    lm_head: Array,
+    embed_tokens: Embedding,
+    lm_head: Linear,
     norm: Array,
     layers: Vec<DecoderLayer>,
     caches: Vec<Option<KvCache>>,
@@ -46,15 +46,17 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn load(weights: &mut Weights, cfg: &ModelConfig) -> Result<Self> {
-        Self::load_with_prefix(weights, &cfg.text, "thinker.")
+        Self::load_with_prefix(weights, &cfg.text, "thinker.", None)
     }
 
     /// Load a Qwen3 decoder whose tensors live under `prefix` (`"thinker."`
-    /// for the ASR checkpoint, `""` for a standalone Qwen3 LM).
+    /// for the ASR checkpoint, `""` for a standalone Qwen3 LM). Pass `quant`
+    /// for MLX-quantized checkpoints (4/8-bit).
     pub fn load_with_prefix(
         weights: &mut Weights,
         t: &crate::config::TextConfig,
         prefix: &str,
+        quant: Option<QuantParams>,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(t.num_hidden_layers as usize);
         for i in 0..t.num_hidden_layers {
@@ -62,23 +64,25 @@ impl Decoder {
             layers.push(DecoderLayer {
                 input_ln: weights.take(&format!("{lp}.input_layernorm.weight"))?,
                 post_ln: weights.take(&format!("{lp}.post_attention_layernorm.weight"))?,
-                q_w: weights.take(&format!("{lp}.self_attn.q_proj.weight"))?,
-                k_w: weights.take(&format!("{lp}.self_attn.k_proj.weight"))?,
-                v_w: weights.take(&format!("{lp}.self_attn.v_proj.weight"))?,
-                o_w: weights.take(&format!("{lp}.self_attn.o_proj.weight"))?,
+                q_w: Linear::take(weights, &format!("{lp}.self_attn.q_proj"), quant)?,
+                k_w: Linear::take(weights, &format!("{lp}.self_attn.k_proj"), quant)?,
+                v_w: Linear::take(weights, &format!("{lp}.self_attn.v_proj"), quant)?,
+                o_w: Linear::take(weights, &format!("{lp}.self_attn.o_proj"), quant)?,
                 q_norm: weights.take(&format!("{lp}.self_attn.q_norm.weight"))?,
                 k_norm: weights.take(&format!("{lp}.self_attn.k_norm.weight"))?,
-                gate_w: weights.take(&format!("{lp}.mlp.gate_proj.weight"))?,
-                up_w: weights.take(&format!("{lp}.mlp.up_proj.weight"))?,
-                down_w: weights.take(&format!("{lp}.mlp.down_proj.weight"))?,
+                gate_w: Linear::take(weights, &format!("{lp}.mlp.gate_proj"), quant)?,
+                up_w: Linear::take(weights, &format!("{lp}.mlp.up_proj"), quant)?,
+                down_w: Linear::take(weights, &format!("{lp}.mlp.down_proj"), quant)?,
             });
         }
 
-        let embed_tokens = weights.take(&format!("{prefix}model.embed_tokens.weight"))?;
+        let embed_tokens =
+            Embedding::take(weights, &format!("{prefix}model.embed_tokens"), quant)?;
         // Prefer an explicit lm_head when present; fall back to tied embeddings.
-        let lm_head = match weights.take(&format!("{prefix}lm_head.weight")) {
-            Ok(w) => w,
-            Err(_) => embed_tokens.clone(),
+        let lm_head = if weights.contains(&format!("{prefix}lm_head.weight")) {
+            Linear::take(weights, &format!("{prefix}lm_head"), quant)?
+        } else {
+            embed_tokens.as_linear()
         };
         let norm = weights.take(&format!("{prefix}model.norm.weight"))?;
 
@@ -110,8 +114,7 @@ impl Decoder {
     pub fn embed(&self, ids: &[u32]) -> Result<Array> {
         let ids_i32: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
         let idx = Array::from_slice(&ids_i32, &[ids_i32.len() as i32]);
-        let emb = self.embed_tokens.index(&idx);
-        Ok(emb.as_dtype(Dtype::Bfloat16)?)
+        self.embed_tokens.lookup(&idx)
     }
 
     /// Prefill the full prompt embedding sequence and return logits for the
@@ -142,10 +145,18 @@ impl Decoder {
 
     fn logits(&self, hidden: &Array) -> Result<Array> {
         let h = rms_norm(hidden, &self.norm, self.eps)?;
-        // Compute logits in f32 for numerically stable argmax.
-        let h = h.as_dtype(Dtype::Float32)?;
-        let w = self.lm_head.as_dtype(Dtype::Float32)?;
-        linear(&h, &w, None)
+        let h = h.reshape(&[1, -1])?;
+        let out = match &self.lm_head {
+            // Compute dense logits in f32 for numerically stable argmax.
+            Linear::Dense(w) => {
+                let h = h.as_dtype(Dtype::Float32)?;
+                let w = w.as_dtype(Dtype::Float32)?;
+                ops::matmul(&h, &w.transpose()?)?
+            }
+            // quantized_matmul runs in the activation dtype (bf16); cast after.
+            q => q.apply(&h)?.as_dtype(Dtype::Float32)?,
+        };
+        Ok(out.reshape(&[-1])?)
     }
 
     /// Greedy argmax over a `[vocab]` logits vector.
@@ -193,9 +204,9 @@ impl Decoder {
         let seq = h.shape()[0];
         let x = rms_norm(h, &input_ln, eps)?;
 
-        let q = linear(&x, &q_w, None)?;
-        let k = linear(&x, &k_w, None)?;
-        let v = linear(&x, &v_w, None)?;
+        let q = q_w.apply(&x)?;
+        let k = k_w.apply(&x)?;
+        let v = v_w.apply(&x)?;
 
         // [seq, n_heads, head_dim] for per-head RMSNorm.
         let q = q.reshape(&[seq, n_heads, head_dim])?;
@@ -248,13 +259,13 @@ impl Decoder {
         let attn = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[seq, n_heads * head_dim])?;
-        let attn = linear(&attn, &o_w, None)?;
+        let attn = o_w.apply(&attn)?;
         let h = ops::add(h, &attn)?;
 
         let x = rms_norm(&h, &post_ln, eps)?;
-        let gate = nn::silu(linear(&x, &gate_w, None)?)?;
-        let up = linear(&x, &up_w, None)?;
-        let mlp = linear(&ops::multiply(&gate, &up)?, &down_w, None)?;
+        let gate = nn::silu(gate_w.apply(&x)?)?;
+        let up = up_w.apply(&x)?;
+        let mlp = down_w.apply(&ops::multiply(&gate, &up)?)?;
         Ok(ops::add(&h, &mlp)?)
     }
 }

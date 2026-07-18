@@ -14,6 +14,8 @@ pub mod encoder;
 #[cfg(feature = "mlx")]
 pub mod generate;
 #[cfg(feature = "mlx")]
+pub mod qlinear;
+#[cfg(feature = "mlx")]
 pub mod weights;
 
 #[cfg(feature = "mlx")]

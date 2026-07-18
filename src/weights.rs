@@ -54,6 +54,11 @@ impl Weights {
             .ok_or_else(|| Error::MissingTensor(name.to_string()))
     }
 
+    /// Whether the checkpoint (still) contains a tensor with this name.
+    pub fn contains(&self, name: &str) -> bool {
+        self.map.contains_key(name)
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(String::as_str)
     }
