@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -56,6 +56,9 @@ struct Args {
 struct AppState {
     model: Mutex<AsrModel>,
     translator: Option<Mutex<Translator>>,
+    /// Last `(text, target, translation)`; live mode often re-sends the same
+    /// transcript (e.g. during pauses), so this skips redundant generation.
+    translation_cache: Mutex<Option<(String, String, String)>>,
     api_key: Option<String>,
     max_tokens: usize,
     model_id: String,
@@ -85,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         model: Mutex::new(model),
         translator,
+        translation_cache: Mutex::new(None),
         api_key: args.api_key,
         max_tokens: args.max_tokens,
         model_id: args.model_id,
@@ -96,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/audio/transcriptions", post(transcribe))
+        .route("/v1/translate", post(translate_text))
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
@@ -242,16 +247,24 @@ async function transcribe(blob, filename, language, translateTo) {
   return j;
 }
 
-// Growing-blob streaming: MediaRecorder chunks accumulate from the start;
-// every interval the whole recording so far is re-transcribed (and the
-// transcript re-translated). The models are fast enough to stay ahead of
-// real time for minutes.
+// Segmented streaming: MediaRecorder chunks accumulate and the recording so
+// far is re-transcribed every interval. To keep the per-step cost (and thus
+// the latency) bounded, the recorder is restarted every SEGMENT_MS; finished
+// segments are frozen and prepended to the display. Translation runs in a
+// separate loop against /v1/translate so it never blocks transcription.
+const SEGMENT_MS = 15000;
+const STEP_MS = 1500;
+const TR_MS = 1200;
 const micBtn = document.getElementById('mic');
 const asrOut = document.getElementById('asrOut');
 const trOut = document.getElementById('trOut');
 const stat = document.getElementById('stat');
 const dot = document.getElementById('dot');
-let rec = null, stream = null, chunks = [], timer = null, busy = false;
+let rec = null, stream = null, chunks = [], timer = null, trTimer = null;
+let busy = false, trBusy = false, lastTranslated = null;
+let segStart = 0;
+let segTexts = [], segTrs = [];   // committed (frozen) segments
+let curText = '', curTr = '';     // current segment, still changing
 
 function extFor(mime) {
   if (!mime) return 'webm';
@@ -260,26 +273,96 @@ function extFor(mime) {
   return 'webm';
 }
 
+function render() {
+  const t = segTexts.concat(curText ? [curText] : []).join(' ');
+  const tr = segTrs.concat(curTr ? [curTr] : []).join(' ');
+  asrOut.classList.toggle('muted', !t);
+  asrOut.textContent = t || '…';
+  const target = document.getElementById('target').value;
+  if (target) {
+    trOut.classList.toggle('muted', !tr);
+    trOut.textContent = tr || '…';
+  } else {
+    trOut.classList.add('muted');
+    trOut.textContent = '(çeviri kapalı)';
+  }
+}
+
+async function fetchTranslation(text, target) {
+  const r = await fetch('/v1/translate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, target }),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error?.message || r.status);
+  return j.translation;
+}
+
+// Continuously translates the current partial transcript, independent of the
+// transcription loop.
+async function translateStep() {
+  const target = document.getElementById('target').value;
+  if (!target || trBusy) return;
+  const text = curText;
+  if (!text || text === lastTranslated) return;
+  trBusy = true;
+  try {
+    curTr = await fetchTranslation(text, target);
+    lastTranslated = text;
+    render();
+  } catch (err) {
+    // transient; next tick retries
+  } finally {
+    trBusy = false;
+  }
+}
+
+// Re-translate a frozen segment with its final text (replaces the possibly
+// stale partial translation).
+function finalizeSegment(idx, text) {
+  const target = document.getElementById('target').value;
+  if (!target || !text) return;
+  fetchTranslation(text, target)
+    .then((tr) => { segTrs[idx] = tr; render(); })
+    .catch(() => {});
+}
+
+function startSegment() {
+  chunks = [];
+  rec = new MediaRecorder(stream);
+  rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+  rec.start(500);
+  segStart = performance.now();
+}
+
 async function liveStep(final = false) {
   if (busy || chunks.length === 0) return;
   busy = true;
+  // Segment full: freeze what we have and restart the recorder so the next
+  // request only carries fresh audio (bounds per-step latency).
+  const rollover = rec && (performance.now() - segStart) > SEGMENT_MS;
+  if (rollover) {
+    rec.stop();
+    await new Promise(r => setTimeout(r, 150)); // flush last chunk
+  }
+  const mime = rec ? rec.mimeType : 'audio/webm';
+  const blob = new Blob(chunks, { type: mime });
+  if (rollover) startSegment();
   try {
-    const mime = rec ? rec.mimeType : 'audio/webm';
-    const blob = new Blob(chunks, { type: mime });
     const t0 = performance.now();
-    const target = document.getElementById('target').value;
     const j = await transcribe(blob, 'live.' + extFor(mime),
-                               document.getElementById('srcLang').value, target);
+                               document.getElementById('srcLang').value, null);
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    asrOut.classList.remove('muted');
-    asrOut.textContent = j.text || '…';
-    if (target) {
-      trOut.classList.remove('muted');
-      trOut.textContent = j.translation || '…';
-    } else {
-      trOut.classList.add('muted');
-      trOut.textContent = '(çeviri kapalı)';
+    curText = j.text || '';
+    if (rollover || final) {
+      const idx = segTexts.length;
+      segTexts.push(curText);
+      segTrs.push(curTr || '…');
+      finalizeSegment(idx, curText);
+      curText = ''; curTr = ''; lastTranslated = null;
     }
+    render();
     stat.textContent = (j.duration?.toFixed(0) || '?') + ' sn ses · adım ' +
                        secs + ' sn' + (j.language ? ' · ' + j.language : '');
   } catch (err) {
@@ -293,13 +376,16 @@ async function liveStep(final = false) {
 micBtn.addEventListener('click', async () => {
   if (rec) { // stop
     clearInterval(timer); timer = null;
-    rec.stop();
+    clearInterval(trTimer); trTimer = null;
+    const r = rec;
+    rec = null;
+    r.stop();
     stream.getTracks().forEach(t => t.stop());
-    rec = null; stream = null;
+    stream = null;
     micBtn.textContent = 'Dinlemeye başla';
     micBtn.classList.remove('rec');
     dot.style.visibility = 'hidden';
-    setTimeout(() => liveStep(true), 400); // final pass with the full audio
+    setTimeout(() => liveStep(true), 400); // final pass with remaining audio
     return;
   }
   try {
@@ -308,11 +394,10 @@ micBtn.addEventListener('click', async () => {
     trOut.textContent = 'Mikrofon izni alınamadı: ' + err.message;
     return;
   }
-  chunks = [];
-  rec = new MediaRecorder(stream);
-  rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-  rec.start(1000); // 1 s chunk'lar
-  timer = setInterval(liveStep, 2500);
+  segTexts = []; segTrs = []; curText = ''; curTr = ''; lastTranslated = null;
+  startSegment();
+  timer = setInterval(liveStep, STEP_MS);
+  trTimer = setInterval(translateStep, TR_MS);
   micBtn.textContent = 'Durdur';
   micBtn.classList.add('rec');
   dot.style.visibility = 'visible';
@@ -449,11 +534,28 @@ async fn transcribe(
     let translation = match (&translate_to, &state.translator) {
         (Some(target), Some(translator)) if !result.text.is_empty() => {
             let target_name = resolve_target_language(target);
-            let mut tr = translator.lock().await;
-            Some(
-                tr.translate(&result.text, &target_name)
-                    .map_err(|e| ApiError::internal(format!("translation: {e}")))?,
-            )
+            let cached = {
+                let cache = state.translation_cache.lock().await;
+                cache.as_ref().and_then(|(t, tgt, tr)| {
+                    (t == &result.text && tgt == &target_name).then(|| tr.clone())
+                })
+            };
+            match cached {
+                Some(tr) => Some(tr),
+                None => {
+                    let translated = {
+                        let mut tr = translator.lock().await;
+                        tr.translate(&result.text, &target_name)
+                            .map_err(|e| ApiError::internal(format!("translation: {e}")))?
+                    };
+                    *state.translation_cache.lock().await = Some((
+                        result.text.clone(),
+                        target_name,
+                        translated.clone(),
+                    ));
+                    Some(translated)
+                }
+            }
         }
         _ => None,
     };
@@ -496,6 +598,53 @@ async fn transcribe(
             .into_response())
         }
     }
+}
+
+#[derive(Deserialize)]
+struct TranslateRequest {
+    text: String,
+    target: String,
+}
+
+/// Standalone text translation endpoint. Lets the live UI fetch translations
+/// in parallel with (instead of serially after) transcription steps.
+async fn translate_text(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TranslateRequest>,
+) -> Result<Response, ApiError> {
+    authorize(&headers, state.api_key.as_deref())?;
+    let Some(translator) = &state.translator else {
+        return Err(ApiError::bad_request(
+            "translation not available: start the server with --translator-dir",
+        ));
+    };
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return Ok(Json(serde_json::json!({ "translation": "" })).into_response());
+    }
+    let target_name = resolve_target_language(&req.target);
+
+    let cached = {
+        let cache = state.translation_cache.lock().await;
+        cache.as_ref().and_then(|(t, tgt, tr)| {
+            (t == &text && tgt == &target_name).then(|| tr.clone())
+        })
+    };
+    let translation = match cached {
+        Some(tr) => tr,
+        None => {
+            let translated = {
+                let mut tr = translator.lock().await;
+                tr.translate(&text, &target_name)
+                    .map_err(|e| ApiError::internal(format!("translation: {e}")))?
+            };
+            *state.translation_cache.lock().await =
+                Some((text, target_name, translated.clone()));
+            translated
+        }
+    };
+    Ok(Json(serde_json::json!({ "translation": translation })).into_response())
 }
 
 /// Map a language code ("tr") to the English name used in the translation
