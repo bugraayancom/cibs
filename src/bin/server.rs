@@ -56,9 +56,17 @@ struct Args {
     model_id: String,
 }
 
+/// Both models live behind a single lock: MLX does not tolerate concurrent
+/// GPU evaluation from multiple threads (segfaults), so all inference —
+/// transcription steps and translations alike — must be serialized.
+struct Engines {
+    asr: AsrModel,
+    translator: Option<Translator>,
+}
+
 struct AppState {
-    model: Mutex<AsrModel>,
-    translator: Option<Mutex<Translator>>,
+    engines: Mutex<Engines>,
+    has_translator: bool,
     /// Last `(text, target, translation)`; live mode often re-sends the same
     /// transcript (e.g. during pauses), so this skips redundant generation.
     translation_cache: Mutex<Option<(String, String, String)>>,
@@ -105,8 +113,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(AppState {
-        model: Mutex::new(model),
-        translator: translator.map(Mutex::new),
+        has_translator: translator.is_some(),
+        engines: Mutex::new(Engines {
+            asr: model,
+            translator,
+        }),
         translation_cache: Mutex::new(None),
         api_key: args.api_key,
         max_tokens: args.max_tokens,
@@ -259,7 +270,9 @@ Başkanlığı &middot; Tamamen çevrimdışı çalışır.</footer>
 // forced-prefix decode so each step only generates the newest tokens.
 // Translation runs in a separate loop against /v1/translate so it never
 // blocks transcription.
-const TR_MS = 1200;
+// Translation shares the GPU with transcription (single lock), so partial
+// translations run sparsely to avoid starving the live transcript.
+const TR_MS = 2500;
 const micBtn = document.getElementById('mic');
 const asrOut = document.getElementById('asrOut');
 const trOut = document.getElementById('trOut');
@@ -559,22 +572,21 @@ async fn transcribe(
 
     let bytes = file_bytes.ok_or_else(|| ApiError::bad_request("missing form field `file`"))?;
 
-    if translate_to.is_some() && state.translator.is_none() {
+    if translate_to.is_some() && !state.has_translator {
         return Err(ApiError::bad_request(
             "translation not available: start the server with --translator-dir",
         ));
     }
 
     let max_tokens = state.max_tokens;
-    let result = {
-        let mut model = state.model.lock().await;
-        model
-            .transcribe_bytes(&bytes, &filename, language.as_deref(), max_tokens)
-            .map_err(|e| ApiError::internal(e.to_string()))?
-    };
+    let mut engines = state.engines.lock().await;
+    let result = engines
+        .asr
+        .transcribe_bytes(&bytes, &filename, language.as_deref(), max_tokens)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     // Optional local translation of the transcript.
-    let translation = match (&translate_to, &state.translator) {
+    let translation = match (&translate_to, engines.translator.as_mut()) {
         (Some(target), Some(translator)) if !result.text.is_empty() => {
             let target_name = resolve_target_language(target);
             let cached = {
@@ -586,11 +598,9 @@ async fn transcribe(
             match cached {
                 Some(tr) => Some(tr),
                 None => {
-                    let translated = {
-                        let mut tr = translator.lock().await;
-                        tr.translate(&result.text, &target_name)
-                            .map_err(|e| ApiError::internal(format!("translation: {e}")))?
-                    };
+                    let translated = translator
+                        .translate(&result.text, &target_name)
+                        .map_err(|e| ApiError::internal(format!("translation: {e}")))?;
                     *state.translation_cache.lock().await = Some((
                         result.text.clone(),
                         target_name,
@@ -602,6 +612,7 @@ async fn transcribe(
         }
         _ => None,
     };
+    drop(engines);
 
     info!(
         file = %filename,
@@ -679,6 +690,7 @@ async fn live_session(state: Arc<AppState>, mut socket: WebSocket) -> anyhow::Re
     let mut prev_tokens: Vec<u32> = Vec::new();
     let mut step_count = 0usize;
     let mut last_step_len = 0usize;
+    let mut last_text = String::new();
     let mut stopping = false;
     let mut closed = false;
 
@@ -735,6 +747,15 @@ async fn live_session(state: Arc<AppState>, mut socket: WebSocket) -> anyhow::Re
             && (buffer.len() >= last_step_len + chunk_samples || (stopping && has_new));
         if !step_due {
             if stopping {
+                // No new audio to process; still commit the last partial so
+                // the client keeps the final text.
+                if !last_text.is_empty() {
+                    let commit =
+                        serde_json::json!({ "type": "commit", "text": last_text });
+                    let _ = socket
+                        .send(WsMessage::Text(commit.to_string().into()))
+                        .await;
+                }
                 break;
             }
             continue;
@@ -749,8 +770,10 @@ async fn live_session(state: Arc<AppState>, mut socket: WebSocket) -> anyhow::Re
 
         let t0 = Instant::now();
         let step = {
-            let mut model = state.model.lock().await;
-            model.transcribe_stream_step(&buffer, language.as_deref(), &forced, 256)
+            let mut engines = state.engines.lock().await;
+            engines
+                .asr
+                .transcribe_stream_step(&buffer, language.as_deref(), &forced, 256)
         };
         let (tokens, tr) = match step {
             Ok(r) => r,
@@ -767,6 +790,7 @@ async fn live_session(state: Arc<AppState>, mut socket: WebSocket) -> anyhow::Re
         };
         prev_tokens = tokens;
         last_step_len = buffer.len();
+        last_text = tr.text.clone();
         step_count += 1;
 
         let partial = serde_json::json!({
@@ -794,13 +818,22 @@ async fn live_session(state: Arc<AppState>, mut socket: WebSocket) -> anyhow::Re
             prev_tokens.clear();
             step_count = 0;
             last_step_len = 0;
+            last_text.clear();
         }
         if stopping {
             break;
         }
     }
 
+    // Graceful close: send the close frame, then drain until the peer
+    // acknowledges so the TCP socket isn't reset mid-handshake.
     let _ = socket.send(WsMessage::Close(None)).await;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), socket.recv()).await {
+            Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            Ok(Some(Ok(_))) => {}
+        }
+    }
     info!("live session closed");
     Ok(())
 }
@@ -819,11 +852,11 @@ async fn translate_text(
     Json(req): Json<TranslateRequest>,
 ) -> Result<Response, ApiError> {
     authorize(&headers, state.api_key.as_deref())?;
-    let Some(translator) = &state.translator else {
+    if !state.has_translator {
         return Err(ApiError::bad_request(
             "translation not available: start the server with --translator-dir",
         ));
-    };
+    }
     let text = req.text.trim().to_string();
     if text.is_empty() {
         return Ok(Json(serde_json::json!({ "translation": "" })).into_response());
@@ -840,8 +873,13 @@ async fn translate_text(
         Some(tr) => tr,
         None => {
             let translated = {
-                let mut tr = translator.lock().await;
-                tr.translate(&text, &target_name)
+                let mut engines = state.engines.lock().await;
+                let translator = engines
+                    .translator
+                    .as_mut()
+                    .expect("checked has_translator above");
+                translator
+                    .translate(&text, &target_name)
                     .map_err(|e| ApiError::internal(format!("translation: {e}")))?
             };
             *state.translation_cache.lock().await =
